@@ -1,0 +1,759 @@
+# =============================================================================
+#  OnePlus sm8650 (Snapdragon 8 Gen 3 / "pineapple") kernel
+#  KernelSU-Next (SUSFS-integrated) + SUSFS, built with the AOSP clang that the
+#  kernel tree itself pins (build.config.constants -> CLANG_VERSION).
+#
+#  Put this file at   .github/workflows/build-kernel.yml   in ANY repository
+#  (a small separate repo is best), then:  Actions -> Run workflow.
+#  It clones the kernel source itself (shallow), so nothing else is needed.
+#
+#  Design rules (each one exists because of a documented real-world failure):
+#   * Root = pershoot/KernelSU-Next branch dev-susfs. Upstream KernelSU-Next
+#     ships NO SUSFS, and simonpunk's 10_enable_susfs_for_ksu.patch is written
+#     for tiann/KernelSU - it is intentionally NOT applied here.
+#   * Kernel side = simonpunk/susfs4ksu branch gki-android14-6.1
+#     (50_add_susfs_in_gki-android14-6.1.patch + fs/* + include/linux/*).
+#   * The pershoot fork defaults CONFIG_KSU_SAMSUNG_KDP/RKP/DEFEX=y which makes
+#     non-Samsung kernels bootloop -> forced off and verified.
+#   * Kconfig silently drops unknown symbols -> every option is verified in the
+#     final .config, and the KSU/SUSFS objects are compiled in an early gate so
+#     integration problems surface in minutes instead of after the full build.
+#   * Patch rejects are never ignored: the job stops and uploads the .rej files.
+# =============================================================================
+name: Build sm8650 kernel (KernelSU-Next + SUSFS)
+
+run-name: sm8650 KSU-Next+SUSFS (${{ inputs.kernel_branch }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel source repository (HTTPS URL)'
+        required: true
+        default: 'https://github.com/oplus-8650-clo/android_kernel_oneplus_sm8650'
+      kernel_branch:
+        description: 'Kernel branch'
+        required: true
+        default: 'calcite'
+      clang_version:
+        description: 'AOSP clang revision. "auto" = CLANG_VERSION from the kernel build.config.constants (r487747c for this tree)'
+        required: true
+        default: 'auto'
+      defconfig:
+        description: 'Base defconfig (arch/arm64/configs/<name>)'
+        required: true
+        default: 'gki_defconfig'
+      config_fragments:
+        description: 'Space-separated config fragments merged on top (relative to arch/arm64/configs). Same list LineageOS uses for sm8650.'
+        required: true
+        default: 'vendor/pineapple_GKI.config vendor/oplus/pineapple_GKI.config'
+      lto:
+        description: 'LTO mode. keep = whatever the config says (stock behaviour), thin, none (less RAM/faster, for small runners)'
+        required: true
+        type: choice
+        default: 'keep'
+        options:
+          - keep
+          - thin
+          - none
+      disable_btf:
+        description: 'Disable CONFIG_DEBUG_INFO_BTF (only if the BTF/pahole step ever fails)'
+        required: true
+        type: boolean
+        default: false
+      ksun_branch:
+        description: 'pershoot/KernelSU-Next branch'
+        required: true
+        default: 'dev-susfs'
+      ksun_commit:
+        description: 'Optional: pin KernelSU-Next to this commit (empty = branch tip)'
+        required: false
+        default: ''
+      susfs_branch:
+        description: 'simonpunk/susfs4ksu branch (kernel-side patches)'
+        required: true
+        default: 'gki-android14-6.1'
+      susfs_commit:
+        description: 'Optional: pin SUSFS to this commit (empty = branch tip)'
+        required: false
+        default: ''
+      release:
+        description: 'Also publish a GitHub pre-release with the zip'
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: Build Image + AnyKernel3 zip
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      KERNEL_REPO: ${{ inputs.kernel_repo }}
+      KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+      INPUT_CLANG: ${{ inputs.clang_version }}
+      DEFCONFIG: ${{ inputs.defconfig }}
+      CONFIG_FRAGMENTS: ${{ inputs.config_fragments }}
+      LTO_MODE: ${{ inputs.lto }}
+      DISABLE_BTF: ${{ inputs.disable_btf }}
+      KSUN_BRANCH: ${{ inputs.ksun_branch }}
+      KSUN_COMMIT: ${{ inputs.ksun_commit }}
+      SUSFS_BRANCH: ${{ inputs.susfs_branch }}
+      SUSFS_COMMIT: ${{ inputs.susfs_commit }}
+      WORK: ${{ github.workspace }}
+      KERNEL_DIR: ${{ github.workspace }}/kernel
+      TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchain
+
+    steps:
+      # ---------------------------------------------------------------------
+      - name: 1/14 Prepare runner (disk space, swap, helper scripts)
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK/diagnostics" "$WORK/dist" "$TOOLCHAIN_ROOT"
+
+          cat > "$WORK/helpers.sh" <<'EOF'
+          die()  { echo "::error::$*"; exit 1; }
+          warn() { echo "::warning::$*"; }
+          note() { echo "[info] $*"; }
+          retry() {
+            local n=0 max=5
+            until "$@"; do
+              n=$((n+1))
+              if [ "$n" -ge "$max" ]; then return 1; fi
+              echo "[retry $n/$max] $*"; sleep $((n*10))
+            done
+          }
+          git_clone_retry() {
+            local n=0 dest="${@: -1}"
+            until git clone "$@"; do
+              n=$((n+1))
+              if [ "$n" -ge 5 ]; then return 1; fi
+              echo "[retry $n/5] git clone $*"; rm -rf "$dest"; sleep $((n*10))
+            done
+          }
+          EOF
+          # strip the 10 spaces of YAML indentation that the heredoc kept
+          sed -i 's/^          //' "$WORK/helpers.sh"
+
+          cat > "$WORK/kmake.sh" <<'EOF'
+          #!/usr/bin/env bash
+          # Single place that defines how the kernel is built.
+          #  - LLVM=1      : clang/lld/llvm-* for everything that ends up in the kernel
+          #  - HOSTCC=gcc  : build-machine helper tools use the distro gcc (most boring, most tested)
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          export KBUILD_BUILD_USER="${KBUILD_BUILD_USER:-github}"
+          export KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST:-actions}"
+          exec make -j"$(nproc)" O=out \
+            ARCH=arm64 SUBARCH=arm64 \
+            LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld HOSTAR=ar \
+            "$@"
+          EOF
+          sed -i 's/^          //' "$WORK/kmake.sh"
+          chmod +x "$WORK/kmake.sh"
+
+          echo "--- disk before"; df -h / | tail -n1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift 2>/dev/null || true
+          sudo apt-get clean || true
+          echo "--- disk after";  df -h / | tail -n1
+
+          # 8 GB swap so thin-LTO linking can never be killed by the OOM killer
+          sudo swapoff -a || true
+          if sudo fallocate -l 8G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192 status=none; then
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile >/dev/null
+            sudo swapon /swapfile
+          fi
+          free -h
+          nproc
+          git config --global --add safe.directory '*'
+
+      # ---------------------------------------------------------------------
+      - name: 2/14 Install build dependencies
+        run: |
+          set -euo pipefail
+          source "$WORK/helpers.sh"
+          export DEBIAN_FRONTEND=noninteractive
+          retry sudo apt-get update
+          retry sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ca-certificates cpio curl dwarves file flex git \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi kmod libdw-dev libelf-dev \
+            libncurses-dev libssl-dev lz4 openssl patch pigz python3 rsync unzip \
+            xz-utils zip zlib1g-dev zstd
+          pahole --version || true
+
+      # ---------------------------------------------------------------------
+      - name: 3/14 Clone kernel source and sanity-check it
+        id: src
+        run: |
+          set -euo pipefail
+          source "$WORK/helpers.sh"
+
+          git_clone_retry --depth=1 --single-branch --branch "$KERNEL_BRANCH" "$KERNEL_REPO" "$KERNEL_DIR" \
+            || die "cannot clone $KERNEL_REPO (branch $KERNEL_BRANCH)"
+          cd "$KERNEL_DIR"
+
+          KERNEL_SHA=$(git rev-parse HEAD)
+          note "kernel commit: $KERNEL_SHA  $(git log -1 --format=%s)"
+
+          [ -f Makefile ] || die "no top-level Makefile - wrong repo/branch?"
+          [ -f "arch/arm64/configs/$DEFCONFIG" ] || die "arch/arm64/configs/$DEFCONFIG not found"
+          [ -f scripts/kconfig/merge_config.sh ] || die "scripts/kconfig/merge_config.sh not found"
+
+          V=$(sed -n 's/^VERSION = //p' Makefile | head -n1)
+          P=$(sed -n 's/^PATCHLEVEL = //p' Makefile | head -n1)
+          S=$(sed -n 's/^SUBLEVEL = //p' Makefile | head -n1)
+          KVER="$V.$P.$S"
+          note "kernel version: $KVER"
+          if [ "$V.$P" != "6.1" ]; then
+            die "this workflow is built for 6.1 GKI (SUSFS branch gki-android14-6.1); source is $KVER"
+          fi
+
+          # refuse to double-integrate
+          if [ -e fs/susfs.c ] || [ -e include/linux/susfs.h ] || grep -qs susfs fs/Makefile \
+             || [ -e drivers/kernelsu ] || [ -d KernelSU ] || [ -d KernelSU-Next ]; then
+            die "the source tree already contains KernelSU/SUSFS - integrating again would conflict"
+          fi
+
+          # which clang does the tree want?
+          CLANG_VER="$INPUT_CLANG"
+          if [ "$CLANG_VER" = "auto" ]; then
+            CLANG_VER=""
+            if [ -f build.config.constants ]; then
+              CLANG_VER=$(sed -n 's/^CLANG_VERSION=//p' build.config.constants | head -n1 | tr -d '"'"'"'[:space:]')
+            fi
+            if [ -z "$CLANG_VER" ]; then CLANG_VER="r487747c"; warn "no CLANG_VERSION in tree, using r487747c"; fi
+          fi
+          echo "$CLANG_VER" | grep -Eq '^r[0-9]+[a-z0-9]*$' || die "bad clang version '$CLANG_VER'"
+          note "AOSP clang: $CLANG_VER"
+
+          {
+            echo "kernel_sha=$KERNEL_SHA"
+            echo "kver=$KVER"
+            echo "clang_version=$CLANG_VER"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "KERNEL_REPO=$KERNEL_REPO"
+            echo "KERNEL_BRANCH=$KERNEL_BRANCH"
+            echo "KERNEL_SHA=$KERNEL_SHA"
+            echo "KERNEL_VERSION_BASE=$KVER"
+            echo "CLANG_REQUESTED=$CLANG_VER"
+          } > "$WORK/build-info.env"
+
+      # ---------------------------------------------------------------------
+      - name: 4/14 Restore AOSP clang cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/toolchain
+          key: aosp-clang-${{ steps.src.outputs.clang_version }}-v1
+
+      - name: 5/14 Install AOSP clang and smoke-test the toolchain
+        env:
+          CLANG_VERSION: ${{ steps.src.outputs.clang_version }}
+        run: |
+          set -euo pipefail
+          source "$WORK/helpers.sh"
+          DEST="$TOOLCHAIN_ROOT/clang-$CLANG_VERSION"
+          BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
+          REFS="android14-release android14-qpr3-release android14-qpr2-release android14-qpr1-release android15-release android15-qpr2-release android16-release android16-qpr1-release android16-qpr2-release android-latest-release main master"
+          CLANG_BIN=""
+          TOOLCHAIN_NOTE="AOSP clang $CLANG_VERSION"
+
+          if [ -x "$DEST/bin/clang" ]; then
+            note "toolchain restored from cache"
+            CLANG_BIN="$DEST/bin"
+          fi
+
+          # method 1: googlesource tarball of the single clang directory
+          if [ -z "$CLANG_BIN" ]; then
+            for ref in $REFS; do
+              url="$BASE/+archive/refs/heads/$ref/clang-$CLANG_VERSION.tar.gz"
+              note "trying $url"
+              rm -rf "$DEST"; mkdir -p "$DEST"
+              if curl -fL --retry 4 --retry-delay 10 --retry-all-errors --connect-timeout 30 \
+                      -o "$RUNNER_TEMP/clang.tgz" "$url" \
+                 && tar -xzf "$RUNNER_TEMP/clang.tgz" -C "$DEST" \
+                 && [ -x "$DEST/bin/clang" ]; then
+                CLANG_BIN="$DEST/bin"; rm -f "$RUNNER_TEMP/clang.tgz"; break
+              fi
+              rm -f "$RUNNER_TEMP/clang.tgz"
+            done
+          fi
+
+          # method 2: sparse partial clone of the prebuilts repo
+          if [ -z "$CLANG_BIN" ]; then
+            for ref in $REFS; do
+              note "sparse clone, ref $ref"
+              rm -rf "$RUNNER_TEMP/clang-repo" "$DEST"
+              if git clone --depth=1 --filter=blob:none --sparse --branch "$ref" "$BASE" "$RUNNER_TEMP/clang-repo" 2>/dev/null \
+                 && git -C "$RUNNER_TEMP/clang-repo" sparse-checkout set "clang-$CLANG_VERSION" \
+                 && [ -x "$RUNNER_TEMP/clang-repo/clang-$CLANG_VERSION/bin/clang" ]; then
+                mv "$RUNNER_TEMP/clang-repo/clang-$CLANG_VERSION" "$DEST"
+                CLANG_BIN="$DEST/bin"; break
+              fi
+            done
+          fi
+
+          # method 3 (loud, last resort): same major version from apt
+          if [ -z "$CLANG_BIN" ] && [ "$CLANG_VERSION" = "r487747c" ]; then
+            warn "AOSP download failed - falling back to Ubuntu clang-17 (same major version as r487747c)"
+            retry sudo apt-get install -y --no-install-recommends clang-17 lld-17 llvm-17
+            CLANG_BIN="/usr/lib/llvm-17/bin"
+            TOOLCHAIN_NOTE="FALLBACK Ubuntu clang-17 (AOSP $CLANG_VERSION unavailable)"
+          fi
+
+          [ -n "$CLANG_BIN" ] || die "could not obtain clang $CLANG_VERSION from any source"
+          for t in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
+            [ -x "$CLANG_BIN/$t" ] || die "toolchain is missing $t"
+          done
+          echo "$CLANG_BIN" >> "$GITHUB_PATH"
+          export PATH="$CLANG_BIN:$PATH"
+
+          clang --version
+          ld.lld --version
+          [ "$(command -v clang)" = "$CLANG_BIN/clang" ] || die "wrong clang in PATH: $(command -v clang)"
+
+          # smoke test: target object + host helper tool
+          cd "$RUNNER_TEMP"
+          printf 'int f(int x){return x+1;}\n' > t.c
+          clang --target=aarch64-linux-gnu -ffreestanding -fno-pic -c t.c -o t.o
+          file t.o | grep -qi 'aarch64' || die "clang did not produce an aarch64 object"
+          printf 'int main(void){return 0;}\n' > h.c
+          gcc h.c -o h && ./h
+          note "toolchain OK"
+
+          {
+            echo "TOOLCHAIN=$TOOLCHAIN_NOTE"
+            echo "CLANG_VERSION_STRING=$(clang --version | head -n1)"
+          } >> "$WORK/build-info.env"
+
+      # ---------------------------------------------------------------------
+      - name: 6/14 Integrate KernelSU-Next (pershoot dev-susfs)
+        run: |
+          set -euo pipefail
+          source "$WORK/helpers.sh"
+          cd "$KERNEL_DIR"
+
+          URL="https://raw.githubusercontent.com/pershoot/KernelSU-Next/${KSUN_BRANCH}/kernel/setup.sh"
+          retry curl -fsSL "$URL" -o "$RUNNER_TEMP/ksun-setup.sh" \
+            || die "cannot download $URL - does branch '$KSUN_BRANCH' exist in pershoot/KernelSU-Next?"
+          bash "$RUNNER_TEMP/ksun-setup.sh" "$KSUN_BRANCH" 2>&1 | tee "$WORK/diagnostics/ksun-setup.log"
+
+          [ -d KernelSU-Next/.git ] || die "KernelSU-Next was not cloned by setup.sh"
+          cd KernelSU-Next
+          if [ -n "$KSUN_COMMIT" ]; then
+            if ! git cat-file -e "${KSUN_COMMIT}^{commit}" 2>/dev/null; then
+              retry git fetch origin "$KSUN_COMMIT" || die "cannot fetch pinned commit $KSUN_COMMIT"
+            fi
+            # keep a LOCAL BRANCH with the expected name: its Kbuild derives the
+            # version from the branch name + merge-base with origin/dev
+            git checkout -q -B "$KSUN_BRANCH" "$KSUN_COMMIT"
+          fi
+          BR=$(git rev-parse --abbrev-ref HEAD)
+          # setup.sh silently falls back to the default branch if checkout fails - do not accept that
+          [ "$BR" = "$KSUN_BRANCH" ] || die "KernelSU-Next is on '$BR', expected '$KSUN_BRANCH' (silent checkout fallback)"
+          git rev-parse --verify -q origin/dev >/dev/null || warn "origin/dev not found: KernelSU version detection may misbehave"
+          KSUN_SHA=$(git rev-parse HEAD)
+          note "KernelSU-Next: $BR @ $KSUN_SHA"
+          git log -1 --format='%h %s'
+
+          # verify the wiring that setup.sh is supposed to do (repair it if it did not)
+          cd "$KERNEL_DIR"
+          [ -f drivers/kernelsu/Kconfig ] || die "drivers/kernelsu does not resolve to KernelSU-Next/kernel"
+          if ! grep -q 'kernelsu' drivers/Makefile; then
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+            warn "drivers/Makefile was not wired by setup.sh - wired manually"
+          fi
+          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
+            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+            grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || die "could not wire drivers/Kconfig"
+            warn "drivers/Kconfig was not wired by setup.sh - wired manually"
+          fi
+          ls -l drivers/kernelsu
+          grep -n 'kernelsu' drivers/Makefile drivers/Kconfig
+
+          {
+            echo "KSUN_BRANCH=$KSUN_BRANCH"
+            echo "KSUN_SHA=$KSUN_SHA"
+          } >> "$WORK/build-info.env"
+
+      # ---------------------------------------------------------------------
+      - name: 7/14 Apply SUSFS kernel-side patch (fails hard on any reject)
+        run: |
+          set -euo pipefail
+          source "$WORK/helpers.sh"
+
+          git_clone_retry --single-branch --branch "$SUSFS_BRANCH" \
+            https://gitlab.com/simonpunk/susfs4ksu.git "$WORK/susfs4ksu" \
+            || die "cannot clone susfs4ksu branch $SUSFS_BRANCH"
+          cd "$WORK/susfs4ksu"
+          if [ -n "$SUSFS_COMMIT" ]; then git checkout -q "$SUSFS_COMMIT" || die "bad SUSFS commit"; fi
+          SUSFS_SHA=$(git rev-parse HEAD)
+          note "susfs4ksu: $SUSFS_BRANCH @ $SUSFS_SHA"
+          ls -R kernel_patches | head -n 40
+
+          shopt -s nullglob
+          PATCHES=(kernel_patches/50_add_susfs_in_*.patch)
+          shopt -u nullglob
+          [ "${#PATCHES[@]}" -eq 1 ] || die "expected exactly one 50_add_susfs_in_*.patch, found ${#PATCHES[@]}"
+          PATCH_FILE="$WORK/susfs4ksu/${PATCHES[0]}"
+          note "patch: ${PATCHES[0]}"
+
+          cd "$KERNEL_DIR"
+          [ -d "$WORK/susfs4ksu/kernel_patches/fs" ] && [ -d "$WORK/susfs4ksu/kernel_patches/include/linux" ] \
+            || die "susfs4ksu layout changed (kernel_patches/fs or include/linux missing)"
+          cp -v "$WORK"/susfs4ksu/kernel_patches/fs/* fs/
+          cp -v "$WORK"/susfs4ksu/kernel_patches/include/linux/* include/linux/
+          [ -f fs/susfs.c ] && [ -f include/linux/susfs.h ] || die "SUSFS source files were not copied"
+
+          set +e
+          patch -p1 --forward --force --no-backup-if-mismatch < "$PATCH_FILE" > "$WORK/diagnostics/susfs-patch.log" 2>&1
+          RC=$?
+          set -e
+          cat "$WORK/diagnostics/susfs-patch.log"
+
+          mapfile -t REJ < <(find . -path ./.git -prune -o -name '*.rej' -print)
+          if [ "$RC" -ne 0 ] || [ "${#REJ[@]}" -gt 0 ] || grep -qE 'FAILED|Reversed \(or previously applied\)' "$WORK/diagnostics/susfs-patch.log"; then
+            for f in "${REJ[@]}"; do
+              mkdir -p "$WORK/diagnostics/rej/$(dirname "$f")"
+              cp "$f" "$WORK/diagnostics/rej/$f"
+              echo "=== REJECT: $f"; cat "$f"
+            done
+            die "SUSFS kernel patch did not apply cleanly (rc=$RC, ${#REJ[@]} reject file(s)). See the 'diagnostics' artifact."
+          fi
+          FUZZ=$(grep -c 'with fuzz' "$WORK/diagnostics/susfs-patch.log" || true)
+          if [ "$FUZZ" -gt 0 ]; then warn "$FUZZ hunk(s) applied with fuzz - listed in susfs-patch.log"; grep 'with fuzz' "$WORK/diagnostics/susfs-patch.log" || true; fi
+
+          # the patch must have wired SUSFS into the build
+          grep -q 'susfs' fs/Makefile || die "fs/Makefile does not reference susfs after patching"
+          grep -q 'susfs' fs/namespace.c || die "fs/namespace.c does not reference susfs after patching"
+
+          # android14+: protected-exports lists make vendor/GKI modules (Wi-Fi, BT...) fail to load
+          # once the kernel is rebuilt with a different signing key. SUSFS docs say: remove them.
+          # kernel/module/Makefile uses $(wildcard ...) so a missing file just yields an empty list.
+          for f in android/abi_gki_protected_exports_*; do
+            [ -e "$f" ] || continue
+            if grep -qs 'abi_gki_protected_exports' kernel/module/Makefile && ! grep -qs 'wildcard' kernel/module/Makefile; then
+              : > "$f"; note "truncated $f"
+            else
+              rm -f "$f"; note "removed $f"
+            fi
+          done
+
+          {
+            echo "SUSFS_BRANCH=$SUSFS_BRANCH"
+            echo "SUSFS_SHA=$SUSFS_SHA"
+            echo "SUSFS_PATCH=${PATCHES[0]}"
+            echo "SUSFS_FUZZED_HUNKS=$FUZZ"
+          } >> "$WORK/build-info.env"
+
+      # ---------------------------------------------------------------------
+      - name: 8/14 Configure kernel (defconfig + fragments + KSU/SUSFS options)
+        run: |
+          set -euo pipefail
+          source "$WORK/helpers.sh"
+          cd "$KERNEL_DIR"
+
+          FRAGS=()
+          for f in $CONFIG_FRAGMENTS; do
+            if [ ! -f "arch/arm64/configs/$f" ]; then
+              echo "Available *pineapple* configs:"; find arch/arm64/configs -iname '*pineapple*' | sort
+              die "config fragment arch/arm64/configs/$f not found"
+            fi
+            FRAGS+=("arch/arm64/configs/$f")
+          done
+
+          "$WORK/kmake.sh" "$DEFCONFIG"
+          scripts/kconfig/merge_config.sh -m -O out out/.config "${FRAGS[@]}" 2>&1 | tee "$WORK/diagnostics/merge_config.log"
+
+          # ---- derive the option list from the Kconfig that is ACTUALLY in the tree ----
+          python3 - "$KERNEL_DIR/drivers/kernelsu" "$WORK/ksu-opts.txt" "$WORK/ksu-all-symbols.txt" <<'PY'
+          import os, re, sys
+          root, out_opts, out_all = sys.argv[1], sys.argv[2], sys.argv[3]
+          root = os.path.realpath(root)
+          syms = {}
+          for dp, _, fns in os.walk(root):
+              for fn in fns:
+                  if not fn.startswith("Kconfig"):
+                      continue
+                  cur = None
+                  with open(os.path.join(dp, fn), errors="ignore") as fh:
+                      for line in fh:
+                          m = re.match(r"\s*(?:menu)?config\s+([A-Za-z0-9_]+)\s*$", line)
+                          if m:
+                              cur = m.group(1)
+                              syms.setdefault(cur, None)
+                              continue
+                          m = re.match(r"\s*(bool|tristate|string|int|hex)\b", line)
+                          if m and cur and syms.get(cur) is None:
+                              syms[cur] = m.group(1)
+          with open(out_all, "w") as fh:
+              for k in sorted(syms):
+                  fh.write("%s %s\n" % (k, syms[k]))
+          opts = ["-e KSU"]
+          for k in sorted(syms):
+              if k.startswith("KSU_SAMSUNG"):
+                  opts.append("-d " + k)                     # KDP/RKP/DEFEX -> bootloop on non-Samsung
+              elif k.startswith("KSU_SUSFS") and syms[k] == "bool" and not re.search(r"DEBUG|TEST", k):
+                  opts.append("-e " + k)
+          with open(out_opts, "w") as fh:
+              fh.write("\n".join(opts) + "\n")
+          PY
+          echo "--- KernelSU Kconfig symbols found:"; cat "$WORK/ksu-all-symbols.txt"
+          echo "--- options that will be applied:";   cat "$WORK/ksu-opts.txt"
+          grep -qx -e '-e KSU_SUSFS' "$WORK/ksu-opts.txt" || die "KSU_SUSFS is not declared in KernelSU-Next Kconfig - wrong KernelSU-Next branch (needs the SUSFS-integrated dev-susfs)"
+
+          ARGS=()
+          while read -r flag sym; do ARGS+=("$flag" "$sym"); done < "$WORK/ksu-opts.txt"
+          ARGS+=(-d WERROR)                                   # warnings must never fail a CI build
+
+          case "$LTO_MODE" in
+            thin) ARGS+=(-e LTO_CLANG_THIN -d LTO_CLANG_FULL -d LTO_NONE) ;;
+            none) ARGS+=(-e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL) ;;
+            *)    : ;;
+          esac
+
+          BTF_OFF=0
+          if [ "$DISABLE_BTF" = "true" ]; then BTF_OFF=1; fi
+          if ! command -v pahole >/dev/null 2>&1; then
+            BTF_OFF=1; warn "pahole missing - disabling BTF"
+          else
+            PV=$(pahole --version | sed 's/^v//')
+            if [ "$(printf '%s\n' 1.22 "$PV" | sort -V | head -n1)" != "1.22" ]; then
+              BTF_OFF=1; warn "pahole $PV is older than 1.22 - disabling BTF"
+            fi
+          fi
+          if [ "$BTF_OFF" = "1" ]; then ARGS+=(-d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES); fi
+
+          scripts/config --file out/.config "${ARGS[@]}"
+          "$WORK/kmake.sh" olddefconfig 2>&1 | tee "$WORK/diagnostics/olddefconfig.log"
+
+          # ---- verify the RESOLVED config (Kconfig silently drops what it does not know) ----
+          cfg() { grep -qx "CONFIG_$1=y" out/.config; }
+          cfg ARM64        || die "CONFIG_ARM64 is not set"
+          cfg KSU          || die "CONFIG_KSU=y did not survive olddefconfig (dependency missing?)"
+          cfg KSU_SUSFS    || die "CONFIG_KSU_SUSFS=y did not survive olddefconfig"
+          if grep -E '^CONFIG_KSU_SAMSUNG[A-Z_]*=y' out/.config; then
+            die "a Samsung helper option is enabled - this bootloops non-Samsung kernels"
+          fi
+          cfg ARCH_PINEAPPLE || warn "CONFIG_ARCH_PINEAPPLE is not enabled - are the pineapple fragments really applied?"
+          if grep -qx 'CONFIG_TRIM_UNUSED_KSYMS=y' out/.config; then
+            warn "CONFIG_TRIM_UNUSED_KSYMS=y - vendor modules may miss exported symbols"
+          fi
+          MISSING=""
+          while read -r flag sym; do
+            if [ "$flag" = "-e" ] && ! cfg "$sym"; then MISSING="$MISSING $sym"; fi
+          done < "$WORK/ksu-opts.txt"
+          if [ -n "$MISSING" ]; then warn "requested but NOT enabled after olddefconfig:$MISSING"; fi
+
+          echo "--- resolved config (selected lines)"
+          grep -E '^(# )?CONFIG_(KSU|LTO_|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|MODULE_SIG_PROTECT|TRIM_UNUSED_KSYMS|DEBUG_INFO_BTF|WERROR|LOCALVERSION|ARCH_PINEAPPLE)' out/.config || true
+          cp out/.config "$WORK/dist/config"
+          {
+            echo "KSU_OPTIONS_ENABLED=$(grep -c '^-e' "$WORK/ksu-opts.txt")"
+            echo "LTO_RESOLVED=$(grep -E '^CONFIG_LTO_(CLANG_THIN|CLANG_FULL|NONE)=y' out/.config | tr '\n' ' ')"
+            echo "BTF_ENABLED=$(grep -qx 'CONFIG_DEBUG_INFO_BTF=y' out/.config && echo yes || echo no)"
+          } >> "$WORK/build-info.env"
+
+      # ---------------------------------------------------------------------
+      - name: 9/14 Early gate - compile KernelSU + SUSFS objects first (minutes, not hours)
+        run: |
+          set -euo pipefail
+          source "$WORK/helpers.sh"
+          cd "$KERNEL_DIR"
+          "$WORK/kmake.sh" prepare 2>&1 | tee "$WORK/diagnostics/prepare.log"
+          TARGETS=(drivers/kernelsu/ fs/susfs.o fs/namespace.o)
+          GKI_MOD=$(find kernel/module -maxdepth 1 -name gki_module.c 2>/dev/null | head -n1 || true)
+          if [ -n "$GKI_MOD" ]; then TARGETS+=("${GKI_MOD%.c}.o"); fi
+          note "compiling: ${TARGETS[*]}"
+          "$WORK/kmake.sh" "${TARGETS[@]}" 2>&1 | tee "$WORK/diagnostics/early-gate.log"
+          note "early gate passed"
+
+      # ---------------------------------------------------------------------
+      - name: 10/14 Build Image
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          date -u +'build started %F %T UTC'
+          "$WORK/kmake.sh" Image 2>&1 | tee "$WORK/build.log"
+          date -u +'build finished %F %T UTC'
+
+      - name: Show first errors (only if the build failed)
+        if: failure()
+        run: |
+          if [ -f "$WORK/build.log" ]; then
+            echo "=== first error lines ==="
+            grep -nE 'error:|Error [0-9]+|undefined (symbol|reference)|No rule to make target|ld.lld: error' "$WORK/build.log" | head -n 60 || true
+            echo "=== tail ==="
+            tail -n 60 "$WORK/build.log" || true
+          fi
+
+      # ---------------------------------------------------------------------
+      - name: 11/14 Verify the built kernel really contains KernelSU + SUSFS
+        run: |
+          set -euo pipefail
+          source "$WORK/helpers.sh"
+          cd "$KERNEL_DIR"
+          IMG=out/arch/arm64/boot/Image
+          [ -s "$IMG" ] || die "Image was not produced"
+          [ -f out/System.map ] || die "out/System.map missing"
+          SUSFS_SYMS=$(grep -ci 'susfs' out/System.map || true)
+          KSU_SYMS=$(grep -ci 'ksu' out/System.map || true)
+          note "System.map: $SUSFS_SYMS susfs symbols, $KSU_SYMS ksu symbols"
+          [ "$SUSFS_SYMS" -gt 0 ] || die "no SUSFS symbols in the final kernel"
+          [ "$KSU_SYMS" -gt 0 ]   || die "no KernelSU symbols in the final kernel"
+          grep -qE ' susfs_init$' out/System.map || warn "susfs_init not found in System.map (name may differ in this SUSFS version)"
+          if strings -a "$IMG" | grep -qi 'susfs'; then note "susfs strings present in Image"; else warn "no susfs strings in Image"; fi
+
+          KREL=$(cat out/include/config/kernel.release)
+          note "kernel release: $KREL"
+          cp "$IMG" "$WORK/dist/Image"
+          cp "$WORK/build.log" "$WORK/dist/build.log"
+          SIZE=$(stat -c %s "$IMG")
+          {
+            echo "KERNEL_RELEASE=$KREL"
+            echo "IMAGE_BYTES=$SIZE"
+            echo "SUSFS_SYMBOLS=$SUSFS_SYMS"
+            echo "KSU_SYMBOLS=$KSU_SYMS"
+            echo "KSU_VERSION_LINES=$(grep -aiE 'KernelSU.*version|KSU_VERSION|SUSFS_VERSION' "$WORK/build.log" | head -n3 | tr '\n' ';')"
+          } >> "$WORK/build-info.env"
+          echo "KREL=$KREL" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------------
+      - name: 12/14 Package AnyKernel3 zip
+        run: |
+          set -euo pipefail
+          source "$WORK/helpers.sh"
+          git_clone_retry --depth=1 https://github.com/osm0sis/AnyKernel3.git "$WORK/ak3" || die "cannot clone AnyKernel3"
+          cd "$WORK/ak3"
+          rm -rf .git .github
+          cp "$WORK/dist/Image" ./Image
+
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script - sm8650 KernelSU-Next + SUSFS
+          properties() { '
+          kernel.string=KernelSU-Next + SUSFS (sm8650)
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=
+          device.name2=
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          ### AnyKernel install
+          ## boot files attributes
+          boot_attributes() {
+          set_perm_recursive 0 0 755 644 $RAMDISK/*;
+          set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
+          } # end attributes
+
+          # boot shell variables
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
+          . tools/ak3-core.sh;
+
+          # boot install
+          if [ -L "/dev/block/bootdevice/by-name/init_boot_a" -o -L "/dev/block/by-name/init_boot_a" ]; then
+            split_boot; # for devices with init_boot ramdisk
+            flash_boot; # for devices with init_boot ramdisk
+          else
+            dump_boot; # use split_boot to skip ramdisk unpack, e.g. for devices with init_boot ramdisk
+            write_boot;
+          fi;
+          ## end boot install
+          EOF
+          sed -i 's/^          //' anykernel.sh
+          bash -n anykernel.sh || die "generated anykernel.sh has a syntax error"
+
+          SAFE_REL=$(echo "$KREL" | tr -c 'A-Za-z0-9._-\n' '_')
+          ZIP="sm8650-KSUN-SUSFS-${SAFE_REL}-$(date -u +%Y%m%d-%H%M).zip"
+          zip -r9 "$WORK/dist/$ZIP" . -x '.git*' 'README.md' '*placeholder' >/dev/null
+          unzip -l "$WORK/dist/$ZIP" | head -n 25
+          [ -s "$WORK/dist/$ZIP" ] || die "zip was not created"
+          echo "ZIP_NAME=$ZIP" >> "$GITHUB_ENV"
+          echo "ZIP_NAME=$ZIP" >> "$WORK/build-info.env"
+          cp "$WORK/build-info.env" "$WORK/dist/build-info.txt"
+
+      # ---------------------------------------------------------------------
+      - name: 13/14 Job summary
+        if: always()
+        run: |
+          {
+            echo "## sm8650 KernelSU-Next + SUSFS build"
+            echo
+            echo '```'
+            cat "$WORK/build-info.env" 2>/dev/null || echo "(build did not get far enough to record info)"
+            echo '```'
+            echo
+            echo "Flash the zip with Kernel Flasher / recovery **on the matching ROM**; keep your stock boot image as a backup."
+            echo "Install the KernelSU-Next manager whose version matches the KSU version of this build."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 14/14 Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sm8650-ksun-susfs-${{ github.run_number }}
+          path: |
+            ${{ github.workspace }}/dist/*.zip
+            ${{ github.workspace }}/dist/Image
+            ${{ github.workspace }}/dist/config
+            ${{ github.workspace }}/dist/build-info.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload logs and diagnostics (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ github.run_number }}
+          path: |
+            ${{ github.workspace }}/diagnostics/**
+            ${{ github.workspace }}/build.log
+            ${{ github.workspace }}/ksu-opts.txt
+            ${{ github.workspace }}/ksu-all-symbols.txt
+            ${{ github.workspace }}/build-info.env
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Publish GitHub pre-release (optional)
+        if: success() && inputs.release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="sm8650-ksun-susfs-${{ github.run_number }}"
+          {
+            echo "OnePlus sm8650 kernel with KernelSU-Next (pershoot dev-susfs) + SUSFS."
+            echo
+            echo '```'
+            cat "$WORK/build-info.env"
+            echo '```'
+            echo
+            echo "Use at your own risk. Keep your stock boot image so you can restore it."
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" "$WORK/dist/$ZIP_NAME" \
+            -R "$GITHUB_REPOSITORY" --prerelease \
+            --title "sm8650 KSU-Next + SUSFS ($KREL)" \
+            --notes-file "$RUNNER_TEMP/notes.md"
