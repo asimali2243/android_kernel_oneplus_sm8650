@@ -137,8 +137,6 @@ jobs:
             done
           }
           EOF
-          # strip the 10 spaces of YAML indentation that the heredoc kept
-          sed -i 's/^          //' "$WORK/helpers.sh"
 
           cat > "$WORK/kmake.sh" <<'EOF'
           #!/usr/bin/env bash
@@ -157,7 +155,6 @@ jobs:
             HOSTCC=gcc HOSTCXX=g++ HOSTLD=ld HOSTAR=ar \
             "$@"
           EOF
-          sed -i 's/^          //' "$WORK/kmake.sh"
           chmod +x "$WORK/kmake.sh"
 
           echo "--- disk before"; df -h / | tail -n1
@@ -251,7 +248,8 @@ jobs:
 
       # ---------------------------------------------------------------------
       - name: 4/14 Restore AOSP clang cache
-        uses: actions/cache@v4
+        id: clang-cache
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/toolchain
           key: aosp-clang-${{ steps.src.outputs.clang_version }}-v1
@@ -335,6 +333,13 @@ jobs:
             echo "TOOLCHAIN=$TOOLCHAIN_NOTE"
             echo "CLANG_VERSION_STRING=$(clang --version | head -n1)"
           } >> "$WORK/build-info.env"
+
+      - name: Save AOSP clang cache (right away, so a failed kernel build does not lose it)
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/toolchain
+          key: aosp-clang-${{ steps.src.outputs.clang_version }}-v1
 
       # ---------------------------------------------------------------------
       - name: 6/14 Integrate KernelSU-Next (pershoot dev-susfs)
@@ -557,6 +562,7 @@ jobs:
 
           echo "--- resolved config (selected lines)"
           grep -E '^(# )?CONFIG_(KSU|LTO_|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|MODULE_SIG_PROTECT|TRIM_UNUSED_KSYMS|DEBUG_INFO_BTF|WERROR|LOCALVERSION|ARCH_PINEAPPLE)' out/.config || true
+          mkdir -p "$WORK/dist"
           cp out/.config "$WORK/dist/config"
           {
             echo "KSU_OPTIONS_ENABLED=$(grep -c '^-e' "$WORK/ksu-opts.txt")"
@@ -683,10 +689,9 @@ jobs:
           fi;
           ## end boot install
           EOF
-          sed -i 's/^          //' anykernel.sh
           bash -n anykernel.sh || die "generated anykernel.sh has a syntax error"
 
-          SAFE_REL=$(echo "$KREL" | tr -c 'A-Za-z0-9._-\n' '_')
+          SAFE_REL=$(printf '%s' "$KREL" | sed 's/[^A-Za-z0-9._-]/_/g')
           ZIP="sm8650-KSUN-SUSFS-${SAFE_REL}-$(date -u +%Y%m%d-%H%M).zip"
           zip -r9 "$WORK/dist/$ZIP" . -x '.git*' 'README.md' '*placeholder' >/dev/null
           unzip -l "$WORK/dist/$ZIP" | head -n 25
@@ -694,6 +699,7 @@ jobs:
           echo "ZIP_NAME=$ZIP" >> "$GITHUB_ENV"
           echo "ZIP_NAME=$ZIP" >> "$WORK/build-info.env"
           cp "$WORK/build-info.env" "$WORK/dist/build-info.txt"
+          ( cd "$WORK/dist" && echo "SHA256=$(sha256sum "$ZIP" | cut -d' ' -f1)" >> build-info.txt )
 
       # ---------------------------------------------------------------------
       - name: 13/14 Job summary
