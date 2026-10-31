@@ -19,6 +19,14 @@
 #     final .config, and the KSU/SUSFS objects are compiled in an early gate so
 #     integration problems surface in minutes instead of after the full build.
 #   * Patch rejects are never ignored: the job stops and uploads the .rej files.
+#   * OPLUS kernel trees are NOT self-contained: drivers/base/kernelFwUpdate, mm/oplus_mm,
+#     drivers/soc/oplus/* ... are symlinks into the sibling "-modules" repository. Without it
+#     `make gki_defconfig` dies with  can't open file "drivers/base/kernelFwUpdate/Kconfig".
+#     The workflow therefore uses the LineageOS layout
+#         tree/kernel/oneplus/sm8650           (kernel)
+#         tree/kernel/oneplus/sm8650-modules   (modules)
+#     checks that every symlink resolves, repairs the ones that do not (suffix matching),
+#     and pre-scans all Kconfig 'source' lines so missing files are listed in one go.
 # =============================================================================
 name: Build sm8650 kernel (KernelSU-Next + SUSFS)
 
@@ -35,6 +43,14 @@ on:
         description: 'Kernel branch'
         required: true
         default: 'calcite'
+      modules_repo:
+        description: 'Matching -modules repository (the OPLUS kernel symlinks point into it)'
+        required: true
+        default: 'https://github.com/oplus-8650-clo/android_kernel_oneplus_sm8650-modules'
+      modules_branch:
+        description: 'Modules branch (empty = same name as the kernel branch, else the repo default branch)'
+        required: false
+        default: ''
       clang_version:
         description: 'AOSP clang revision. "auto" = CLANG_VERSION from the kernel build.config.constants (r487747c for this tree)'
         required: true
@@ -106,12 +122,16 @@ jobs:
       SUSFS_BRANCH: ${{ inputs.susfs_branch }}
       SUSFS_COMMIT: ${{ inputs.susfs_commit }}
       WORK: ${{ github.workspace }}
-      KERNEL_DIR: ${{ github.workspace }}/kernel
+      MODULES_REPO: ${{ inputs.modules_repo }}
+      MODULES_BRANCH: ${{ inputs.modules_branch }}
+      TREE: ${{ github.workspace }}/tree
+      KERNEL_DIR: ${{ github.workspace }}/tree/kernel/oneplus/sm8650
+      MODULES_DIR: ${{ github.workspace }}/tree/kernel/oneplus/sm8650-modules
       TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchain
 
     steps:
       # ---------------------------------------------------------------------
-      - name: 1/14 Prepare runner (disk space, swap, helper scripts)
+      - name: 1/15 Prepare runner (disk space, swap, helper scripts)
         run: |
           set -euo pipefail
           mkdir -p "$WORK/diagnostics" "$WORK/dist" "$TOOLCHAIN_ROOT"
@@ -134,6 +154,17 @@ jobs:
               n=$((n+1))
               if [ "$n" -ge 5 ]; then return 1; fi
               echo "[retry $n/5] git clone $*"; rm -rf "$dest"; sleep $((n*10))
+            done
+          }
+          # returns 0 = branch exists, 1 = does not exist, 2 = could not reach the remote
+          branch_exists() {
+            local n=0 rc
+            while :; do
+              rc=0; git ls-remote --exit-code --heads "$1" "$2" >/dev/null 2>&1 || rc=$?
+              if [ "$rc" -eq 0 ]; then return 0; fi
+              if [ "$rc" -eq 2 ]; then return 1; fi
+              n=$((n+1)); if [ "$n" -ge 4 ]; then return 2; fi
+              sleep $((n*5))
             done
           }
           EOF
@@ -175,7 +206,7 @@ jobs:
           git config --global --add safe.directory '*'
 
       # ---------------------------------------------------------------------
-      - name: 2/14 Install build dependencies
+      - name: 2/15 Install build dependencies
         run: |
           set -euo pipefail
           source "$WORK/helpers.sh"
@@ -189,7 +220,7 @@ jobs:
           pahole --version || true
 
       # ---------------------------------------------------------------------
-      - name: 3/14 Clone kernel source and sanity-check it
+      - name: 3/15 Clone kernel source and sanity-check it
         id: src
         run: |
           set -euo pipefail
@@ -247,14 +278,124 @@ jobs:
           } > "$WORK/build-info.env"
 
       # ---------------------------------------------------------------------
-      - name: 4/14 Restore AOSP clang cache
+      - name: 4/15 Clone the matching -modules repo and resolve the OPLUS symlinks
+        id: modules
+        run: |
+          set -euo pipefail
+          source "$WORK/helpers.sh"
+
+          # ---- which branch of the modules repo? ----
+          MB="$MODULES_BRANCH"
+          if [ -z "$MB" ]; then
+            rc=0; branch_exists "$MODULES_REPO" "$KERNEL_BRANCH" || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              MB="$KERNEL_BRANCH"
+            elif [ "$rc" -eq 1 ]; then
+              MB=$(git ls-remote --symref "$MODULES_REPO" HEAD 2>/dev/null | awk '/^ref:/{sub("refs/heads/","",$2); print $2; exit}')
+              [ -n "$MB" ] || die "cannot determine the default branch of $MODULES_REPO"
+              warn "modules repo has no branch '$KERNEL_BRANCH' - using its default branch '$MB'"
+            else
+              die "cannot reach $MODULES_REPO"
+            fi
+          fi
+          note "modules: $MODULES_REPO @ $MB"
+          git_clone_retry --depth=1 --single-branch --branch "$MB" "$MODULES_REPO" "$MODULES_DIR" \
+            || die "cannot clone $MODULES_REPO (branch $MB)"
+          MSHA=$(git -C "$MODULES_DIR" rev-parse HEAD)
+          note "modules commit: $MSHA"
+          ls "$MODULES_DIR"
+
+          # ---- symlinks: which ones are broken right now? ----
+          list_broken() {
+            find "$KERNEL_DIR" -path "$KERNEL_DIR/.git" -prune -o -xtype l -print | sort
+          }
+          list_broken > "$WORK/diagnostics/broken-symlinks-before.txt"
+          BEFORE=$(wc -l < "$WORK/diagnostics/broken-symlinks-before.txt")
+          note "broken symlinks in the kernel tree before healing: $BEFORE"
+          while IFS= read -r l; do
+            if [ -n "$l" ]; then echo "   ${l#$KERNEL_DIR/} -> $(readlink "$l")"; fi
+          done < "$WORK/diagnostics/broken-symlinks-before.txt"
+
+          # ---- heal: re-point every broken link to the file/dir of the same name in the modules repo ----
+          # The link target is normalised (leading ../ removed) and its LONGEST path suffix that exists in
+          # the modules tree wins.  e.g.  ../../../../vendor/oplus/kernel/mm  ->  <modules>/oplus/kernel/mm
+          : > "$WORK/diagnostics/healed-symlinks.txt"
+          HEALED=0
+          while IFS= read -r l; do
+            [ -n "$l" ] || continue
+            tgt=$(readlink "$l")
+            rel="${tgt#/}"
+            while [[ "$rel" == ../* ]]; do rel="${rel#../}"; done
+            rel="${rel#./}"
+            found=""
+            cand="$rel"
+            while [[ "$cand" == */* ]]; do                       # (a) direct hit under the modules root
+              if [ -e "$MODULES_DIR/$cand" ]; then found="$MODULES_DIR/$cand"; break; fi
+              cand="${cand#*/}"
+            done
+            if [ -z "$found" ]; then                             # (b) unique hit anywhere in the modules tree
+              cand="$rel"
+              while [[ "$cand" == */* ]]; do
+                mapfile -t hits < <(find "$MODULES_DIR" -path "$MODULES_DIR/.git" -prune -o -path "*/$cand" -print 2>/dev/null)
+                if [ "${#hits[@]}" -eq 1 ]; then found="${hits[0]}"; break; fi
+                if [ "${#hits[@]}" -gt 1 ]; then warn "ambiguous target for ${l#$KERNEL_DIR/} ($cand): ${#hits[@]} matches - left alone"; break; fi
+                cand="${cand#*/}"
+              done
+            fi
+            if [ -n "$found" ]; then
+              ln -sfn "$found" "$l"
+              HEALED=$((HEALED+1))
+              echo "${l#$KERNEL_DIR/} -> ${found#$TREE/}   (was $tgt)" | tee -a "$WORK/diagnostics/healed-symlinks.txt"
+            fi
+          done < "$WORK/diagnostics/broken-symlinks-before.txt"
+
+          list_broken > "$WORK/diagnostics/broken-symlinks-after.txt"
+          AFTER=$(wc -l < "$WORK/diagnostics/broken-symlinks-after.txt")
+          note "healed: $HEALED   still broken: $AFTER"
+          if [ "$AFTER" -gt 0 ]; then
+            # devicetree links are irrelevant for `make Image`; anything else is worth a warning
+            OTHER=$(grep -vc '/arch/arm64/boot/dts' "$WORK/diagnostics/broken-symlinks-after.txt" || true)
+            if [ "$OTHER" -gt 0 ]; then
+              warn "$OTHER unresolved symlink(s) outside arch/arm64/boot/dts:"
+              grep -v '/arch/arm64/boot/dts' "$WORK/diagnostics/broken-symlinks-after.txt" | sed "s#$KERNEL_DIR/#   #"
+            fi
+          fi
+
+          # ---- preflight: every  source "x/Kconfig"  must exist, otherwise `make gki_defconfig` aborts ----
+          cd "$KERNEL_DIR"
+          : > "$WORK/diagnostics/missing-kconfig-sources.txt"
+          while IFS= read -r p; do
+            if [ -n "$p" ] && [ ! -e "$p" ]; then echo "$p" >> "$WORK/diagnostics/missing-kconfig-sources.txt"; fi
+          done < <(grep -RhoE --include='Kconfig*' '^[[:space:]]*source[[:space:]]+"[^"$]+"' \
+                     drivers kernel mm fs net security sound init lib block crypto ipc arch/arm64 Kconfig 2>/dev/null \
+                   | sed -E 's/^[[:space:]]*source[[:space:]]+"//; s/"$//' | sort -u)
+          MISS=$(wc -l < "$WORK/diagnostics/missing-kconfig-sources.txt")
+          if [ "$MISS" -gt 0 ]; then
+            warn "$MISS Kconfig source file(s) do not exist - make $DEFCONFIG will fail on the first one:"
+            sed 's/^/   /' "$WORK/diagnostics/missing-kconfig-sources.txt"
+          else
+            note "preflight: every Kconfig 'source' file exists"
+          fi
+
+          {
+            echo "MODULES_REPO=$MODULES_REPO"
+            echo "MODULES_BRANCH=$MB"
+            echo "MODULES_SHA=$MSHA"
+            echo "SYMLINKS_BROKEN_BEFORE=$BEFORE"
+            echo "SYMLINKS_HEALED=$HEALED"
+            echo "SYMLINKS_STILL_BROKEN=$AFTER"
+            echo "KCONFIG_SOURCES_MISSING=$MISS"
+          } >> "$WORK/build-info.env"
+
+      # ---------------------------------------------------------------------
+      - name: 5/15 Restore AOSP clang cache
         id: clang-cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/toolchain
           key: aosp-clang-${{ steps.src.outputs.clang_version }}-v1
 
-      - name: 5/14 Install AOSP clang and smoke-test the toolchain
+      - name: 6/15 Install AOSP clang and smoke-test the toolchain
         env:
           CLANG_VERSION: ${{ steps.src.outputs.clang_version }}
         run: |
@@ -342,7 +483,7 @@ jobs:
           key: aosp-clang-${{ steps.src.outputs.clang_version }}-v1
 
       # ---------------------------------------------------------------------
-      - name: 6/14 Integrate KernelSU-Next (pershoot dev-susfs)
+      - name: 7/15 Integrate KernelSU-Next (pershoot dev-susfs)
         run: |
           set -euo pipefail
           source "$WORK/helpers.sh"
@@ -392,7 +533,7 @@ jobs:
           } >> "$WORK/build-info.env"
 
       # ---------------------------------------------------------------------
-      - name: 7/14 Apply SUSFS kernel-side patch (fails hard on any reject)
+      - name: 8/15 Apply SUSFS kernel-side patch (fails hard on any reject)
         run: |
           set -euo pipefail
           source "$WORK/helpers.sh"
@@ -462,7 +603,7 @@ jobs:
           } >> "$WORK/build-info.env"
 
       # ---------------------------------------------------------------------
-      - name: 8/14 Configure kernel (defconfig + fragments + KSU/SUSFS options)
+      - name: 9/15 Configure kernel (defconfig + fragments + KSU/SUSFS options)
         run: |
           set -euo pipefail
           source "$WORK/helpers.sh"
@@ -477,7 +618,13 @@ jobs:
             FRAGS+=("arch/arm64/configs/$f")
           done
 
-          "$WORK/kmake.sh" "$DEFCONFIG"
+          if ! "$WORK/kmake.sh" "$DEFCONFIG" 2>&1 | tee "$WORK/diagnostics/defconfig.log"; then
+            echo "--- Kconfig 'source' files missing (preflight of step 4):"
+            cat "$WORK/diagnostics/missing-kconfig-sources.txt" 2>/dev/null || true
+            echo "--- symlinks that are still broken:"
+            cat "$WORK/diagnostics/broken-symlinks-after.txt" 2>/dev/null || true
+            die "$DEFCONFIG failed - the sibling -modules tree is probably missing or the wrong branch (see lists above)"
+          fi
           scripts/kconfig/merge_config.sh -m -O out out/.config "${FRAGS[@]}" 2>&1 | tee "$WORK/diagnostics/merge_config.log"
 
           # ---- derive the option list from the Kconfig that is ACTUALLY in the tree ----
@@ -571,7 +718,7 @@ jobs:
           } >> "$WORK/build-info.env"
 
       # ---------------------------------------------------------------------
-      - name: 9/14 Early gate - compile KernelSU + SUSFS objects first (minutes, not hours)
+      - name: 10/15 Early gate - compile KernelSU + SUSFS objects first (minutes, not hours)
         run: |
           set -euo pipefail
           source "$WORK/helpers.sh"
@@ -585,7 +732,7 @@ jobs:
           note "early gate passed"
 
       # ---------------------------------------------------------------------
-      - name: 10/14 Build Image
+      - name: 11/15 Build Image
         run: |
           set -euo pipefail
           cd "$KERNEL_DIR"
@@ -604,7 +751,7 @@ jobs:
           fi
 
       # ---------------------------------------------------------------------
-      - name: 11/14 Verify the built kernel really contains KernelSU + SUSFS
+      - name: 12/15 Verify the built kernel really contains KernelSU + SUSFS
         run: |
           set -euo pipefail
           source "$WORK/helpers.sh"
@@ -635,7 +782,7 @@ jobs:
           echo "KREL=$KREL" >> "$GITHUB_ENV"
 
       # ---------------------------------------------------------------------
-      - name: 12/14 Package AnyKernel3 zip
+      - name: 13/15 Package AnyKernel3 zip
         run: |
           set -euo pipefail
           source "$WORK/helpers.sh"
@@ -702,7 +849,7 @@ jobs:
           ( cd "$WORK/dist" && echo "SHA256=$(sha256sum "$ZIP" | cut -d' ' -f1)" >> build-info.txt )
 
       # ---------------------------------------------------------------------
-      - name: 13/14 Job summary
+      - name: 14/15 Job summary
         if: always()
         run: |
           {
@@ -716,7 +863,7 @@ jobs:
             echo "Install the KernelSU-Next manager whose version matches the KSU version of this build."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: 14/14 Upload artifacts
+      - name: 15/15 Upload artifacts
         if: success()
         uses: actions/upload-artifact@v4
         with:
