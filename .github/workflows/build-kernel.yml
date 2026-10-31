@@ -724,6 +724,17 @@ jobs:
           source "$WORK/helpers.sh"
           cd "$KERNEL_DIR"
           "$WORK/kmake.sh" prepare 2>&1 | tee "$WORK/diagnostics/prepare.log"
+
+          # KernelSU includes security/selinux/include/objsec.h, which needs the GENERATED headers
+          # flask.h / av_permissions.h. They are produced when security/selinux/ is built, and
+          # `prepare` does not make them. Build that directory first and on its own (building it in
+          # parallel with drivers/ would be a race). out/ is kept, so the full build reuses them.
+          note "generating SELinux headers (security/selinux/)"
+          "$WORK/kmake.sh" security/selinux/ 2>&1 | tee "$WORK/diagnostics/selinux-headers.log"
+          for h in flask.h av_permissions.h; do
+            [ -f "out/security/selinux/$h" ] || die "out/security/selinux/$h was not generated"
+          done
+
           TARGETS=(drivers/kernelsu/ fs/susfs.o fs/namespace.o)
           GKI_MOD=$(find kernel/module -maxdepth 1 -name gki_module.c 2>/dev/null | head -n1 || true)
           if [ -n "$GKI_MOD" ]; then TARGETS+=("${GKI_MOD%.c}.o"); fi
